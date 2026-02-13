@@ -1,10 +1,9 @@
 /*************************************************
- * BOSS Discord Bot（最終安定版）
+ * BOSS Discord Bot（ポーリング停止版）
  *
- * - GAS(JSON) を定期取得
- * - announceAtISO（JST）に到達したら通知
- * - 予約時刻が変わったら自動で再スケジュール
- * - 少し遅れた通知は即送信（取りこぼし防止）
+ * - 起動時にGAS(JSON)を1回だけ取得
+ * - announceAtISO（JST）に到達したら通知（setTimeoutで予約）
+ * - 定期ポーリングはしない（= doGet連射しない）
  *
  * Node.js 18+ 前提（組み込み fetch 使用）
  *************************************************/
@@ -24,10 +23,9 @@ if (!RACES_JSON_URL) throw new Error("RACES_JSON_URL が未設定です");
 
 // ===== 設定 =====
 const ZONE = "Asia/Tokyo";
-const POLL_INTERVAL_MS = 60 * 1000;           // 1分おき
-const MAX_FUTURE_MS = 48 * 60 * 60 * 1000;    // 48時間先まで予約
-const LATE_GRACE_MS = 3 * 60 * 1000;          // 3分遅れまで即送信
-const RESCHEDULE_DIFF_MS = 1000;              // 1秒以上ズレたら再予約
+const MAX_FUTURE_MS = 48 * 60 * 60 * 1000; // 48時間先まで予約
+const LATE_GRACE_MS = 3 * 60 * 1000;       // 3分遅れまで即送信
+const RESCHEDULE_DIFF_MS = 1000;           // 1秒以上ズレたら再予約（今回は再取得しないので保険程度）
 
 // ===== Discord Client =====
 const client = new Client({
@@ -69,15 +67,14 @@ function cancelSchedule(key) {
   scheduled.delete(key);
 }
 
-// ===== 通知計画 =====
-async function planNotifications() {
+// ===== 通知計画（1回だけ作る） =====
+async function planNotificationsOnce() {
   const nowMs = DateTime.now().setZone(ZONE).toMillis();
 
   const races = await fetchRaces();
-  console.log(`[plan] fetched=${races.length} now=${DateTime.fromMillis(nowMs).toISO()}`);
+  console.log(`[plan-once] fetched=${races.length} now=${DateTime.fromMillis(nowMs).toISO()}`);
 
   let scheduledCount = 0;
-  let updatedCount = 0;
   let sentNowCount = 0;
 
   for (const r of races) {
@@ -95,7 +92,7 @@ async function planNotifications() {
     // 未来すぎるものは無視
     if (diff > MAX_FUTURE_MS) continue;
 
-    // すでに過去 → 救済送信
+    // すでに過去 → 救済送信（直近だけ）
     if (diff <= 0) {
       if (Math.abs(diff) <= LATE_GRACE_MS) {
         cancelSchedule(key);
@@ -106,18 +103,12 @@ async function planNotifications() {
       continue;
     }
 
+    // すでに予約済みならスキップ（今回は起動1回運用なので基本発生しない）
     const existing = scheduled.get(key);
-
-    // 同じ時刻ですでに予約済み
     if (existing && Math.abs(existing.notifyAtMs - notifyAtMs) < RESCHEDULE_DIFF_MS) {
       continue;
     }
-
-    // 時刻変更 → 再予約
-    if (existing) {
-      cancelSchedule(key);
-      updatedCount++;
-    }
+    if (existing) cancelSchedule(key);
 
     const timeoutId = setTimeout(async () => {
       try {
@@ -134,20 +125,14 @@ async function planNotifications() {
     scheduledCount++;
   }
 
-  console.log(
-    `[plan] scheduled=${scheduledCount} updated=${updatedCount} send-now=${sentNowCount} active=${scheduled.size}`
-  );
+  console.log(`[plan-once] scheduled=${scheduledCount} send-now=${sentNowCount} active=${scheduled.size}`);
 }
 
 // ===== 起動 =====
 client.once("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
-  await sendToChannel("🤖 BOSS bot 起動しました。通知監視を開始します。");
-
-  await planNotifications();
-  setInterval(() => {
-    planNotifications().catch(e => console.error("plan error", e));
-  }, POLL_INTERVAL_MS);
+  // 起動通知は送らない（余計な投稿を防ぐ）
+  await planNotificationsOnce();
 });
 
 client.login(DISCORD_TOKEN);
